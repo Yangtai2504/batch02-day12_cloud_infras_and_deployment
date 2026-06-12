@@ -165,7 +165,10 @@ def get_llm(project: str, location: str, model: str) -> ChatVertexAI:
     )
 
 
-async def run_agent(question: str, project: str, location: str, model: str) -> str:
+async def run_agent(
+    question: str, project: str, location: str, model: str,
+    history: list | None = None,
+) -> str:
     from langgraph.prebuilt import create_react_agent
 
     def extract_text(content):
@@ -181,7 +184,8 @@ async def run_agent(question: str, project: str, location: str, model: str) -> s
 
     llm = get_llm(project, location, model)
     graph = create_react_agent(model=llm, tools=TOOLS, prompt=SYSTEM_PROMPT)
-    inputs = {"messages": [{"role": "user", "content": question}]}
+    messages = list(history or []) + [{"role": "user", "content": question}]
+    inputs = {"messages": messages}
 
     final_answer = ""
     async for chunk in graph.astream(inputs, stream_mode="updates"):

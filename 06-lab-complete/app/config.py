@@ -20,6 +20,9 @@ class Settings:
     vertex_model: str = field(default_factory=lambda: os.getenv("VERTEX_MODEL", "gemini-2.5-flash"))
     google_credentials_json: str = field(default_factory=lambda: os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", ""))
 
+    # Redis
+    redis_url: str = field(default_factory=lambda: os.getenv("REDIS_URL", ""))
+
     # Security
     agent_api_key: str = field(default_factory=lambda: os.getenv("AGENT_API_KEY", "dev-key-change-me"))
     allowed_origins: list = field(
