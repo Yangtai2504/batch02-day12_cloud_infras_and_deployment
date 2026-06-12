@@ -1,18 +1,18 @@
 """
-Production AI Agent — Kết hợp tất cả Day 12 concepts
+Production Legal Compliance Agent
+Day 9 Stage 3 agent, productionized with Day 12 patterns.
 
 Checklist:
   ✅ Config từ environment (12-factor)
+  ✅ Vertex AI credentials via env var
   ✅ Structured JSON logging
   ✅ API Key authentication
   ✅ Rate limiting
   ✅ Cost guard
-  ✅ Input validation (Pydantic)
   ✅ Health check + Readiness probe
   ✅ Graceful shutdown
   ✅ Security headers
   ✅ CORS
-  ✅ Error handling
 """
 import os
 import time
@@ -30,13 +30,8 @@ from pydantic import BaseModel, Field
 import uvicorn
 
 from app.config import settings
+from app.agent import setup_vertex_credentials, run_agent
 
-# Mock LLM (thay bằng OpenAI/Anthropic khi có API key)
-from utils.mock_llm import ask as llm_ask
-
-# ─────────────────────────────────────────────────────────
-# Logging — JSON structured
-# ─────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.DEBUG if settings.debug else logging.INFO,
     format='{"ts":"%(asctime)s","lvl":"%(levelname)s","msg":"%(message)s"}',
@@ -47,9 +42,11 @@ START_TIME = time.time()
 _is_ready = False
 _request_count = 0
 _error_count = 0
+_daily_cost = 0.0
+_cost_reset_day = time.strftime("%Y-%m-%d")
 
 # ─────────────────────────────────────────────────────────
-# Simple In-memory Rate Limiter
+# Rate Limiter
 # ─────────────────────────────────────────────────────────
 _rate_windows: dict[str, deque] = defaultdict(deque)
 
@@ -67,11 +64,8 @@ def check_rate_limit(key: str):
     window.append(now)
 
 # ─────────────────────────────────────────────────────────
-# Simple Cost Guard
+# Cost Guard
 # ─────────────────────────────────────────────────────────
-_daily_cost = 0.0
-_cost_reset_day = time.strftime("%Y-%m-%d")
-
 def check_and_record_cost(input_tokens: int, output_tokens: int):
     global _daily_cost, _cost_reset_day
     today = time.strftime("%Y-%m-%d")
@@ -80,7 +74,8 @@ def check_and_record_cost(input_tokens: int, output_tokens: int):
         _cost_reset_day = today
     if _daily_cost >= settings.daily_budget_usd:
         raise HTTPException(503, "Daily budget exhausted. Try tomorrow.")
-    cost = (input_tokens / 1000) * 0.00015 + (output_tokens / 1000) * 0.0006
+    # Gemini 2.5 Flash pricing estimate
+    cost = (input_tokens / 1000) * 0.000075 + (output_tokens / 1000) * 0.0003
     _daily_cost += cost
 
 # ─────────────────────────────────────────────────────────
@@ -102,18 +97,19 @@ def verify_api_key(api_key: str = Security(api_key_header)) -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _is_ready
+    # Setup Vertex AI credentials from env var
+    setup_vertex_credentials(settings.google_credentials_json)
     logger.info(json.dumps({
         "event": "startup",
         "app": settings.app_name,
         "version": settings.app_version,
         "environment": settings.environment,
+        "vertex_project": settings.vertex_project,
+        "vertex_model": settings.vertex_model,
     }))
-    time.sleep(0.1)  # simulate init
     _is_ready = True
     logger.info(json.dumps({"event": "ready"}))
-
     yield
-
     _is_ready = False
     logger.info(json.dumps({"event": "shutdown"}))
 
@@ -142,7 +138,6 @@ async def request_middleware(request: Request, call_next):
     _request_count += 1
     try:
         response: Response = await call_next(request)
-        # Security headers
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers.pop("server", None)
@@ -155,7 +150,7 @@ async def request_middleware(request: Request, call_next):
             "ms": duration,
         }))
         return response
-    except Exception as e:
+    except Exception:
         _error_count += 1
         raise
 
@@ -164,7 +159,7 @@ async def request_middleware(request: Request, call_next):
 # ─────────────────────────────────────────────────────────
 class AskRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=2000,
-                          description="Your question for the agent")
+                          description="Legal/compliance question for the agent")
 
 class AskResponse(BaseModel):
     question: str
@@ -175,13 +170,13 @@ class AskResponse(BaseModel):
 # ─────────────────────────────────────────────────────────
 # Endpoints
 # ─────────────────────────────────────────────────────────
-
 @app.get("/", tags=["Info"])
 def root():
     return {
         "app": settings.app_name,
         "version": settings.app_version,
         "environment": settings.environment,
+        "description": "Legal compliance agent powered by Gemini via Vertex AI",
         "endpoints": {
             "ask": "POST /ask (requires X-API-Key)",
             "health": "GET /health",
@@ -196,15 +191,9 @@ async def ask_agent(
     request: Request,
     _key: str = Depends(verify_api_key),
 ):
-    """
-    Send a question to the AI agent.
+    """Send a legal/compliance question to the agent."""
+    check_rate_limit(_key[:8])
 
-    **Authentication:** Include header `X-API-Key: <your-key>`
-    """
-    # Rate limit per API key
-    check_rate_limit(_key[:8])  # use first 8 chars as key bucket
-
-    # Budget check
     input_tokens = len(body.question.split()) * 2
     check_and_record_cost(input_tokens, 0)
 
@@ -214,7 +203,12 @@ async def ask_agent(
         "client": str(request.client.host) if request.client else "unknown",
     }))
 
-    answer = llm_ask(body.question)
+    answer = await run_agent(
+        question=body.question,
+        project=settings.vertex_project,
+        location=settings.vertex_location,
+        model=settings.vertex_model,
+    )
 
     output_tokens = len(answer.split()) * 2
     check_and_record_cost(0, output_tokens)
@@ -222,30 +216,26 @@ async def ask_agent(
     return AskResponse(
         question=body.question,
         answer=answer,
-        model=settings.llm_model,
+        model=f"vertex/{settings.vertex_model}",
         timestamp=datetime.now(timezone.utc).isoformat(),
     )
 
 
 @app.get("/health", tags=["Operations"])
 def health():
-    """Liveness probe. Platform restarts container if this fails."""
-    status = "ok"
-    checks = {"llm": "mock" if not settings.openai_api_key else "openai"}
     return {
-        "status": status,
+        "status": "ok",
         "version": settings.app_version,
         "environment": settings.environment,
         "uptime_seconds": round(time.time() - START_TIME, 1),
         "total_requests": _request_count,
-        "checks": checks,
+        "llm": f"vertex/{settings.vertex_model}",
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
 @app.get("/ready", tags=["Operations"])
 def ready():
-    """Readiness probe. Load balancer stops routing here if not ready."""
     if not _is_ready:
         raise HTTPException(503, "Not ready")
     return {"ready": True}
@@ -253,14 +243,12 @@ def ready():
 
 @app.get("/metrics", tags=["Operations"])
 def metrics(_key: str = Depends(verify_api_key)):
-    """Basic metrics (protected)."""
     return {
         "uptime_seconds": round(time.time() - START_TIME, 1),
         "total_requests": _request_count,
         "error_count": _error_count,
-        "daily_cost_usd": round(_daily_cost, 4),
+        "daily_cost_usd": round(_daily_cost, 6),
         "daily_budget_usd": settings.daily_budget_usd,
-        "budget_used_pct": round(_daily_cost / settings.daily_budget_usd * 100, 1),
     }
 
 
@@ -274,8 +262,6 @@ signal.signal(signal.SIGTERM, _handle_signal)
 
 
 if __name__ == "__main__":
-    logger.info(f"Starting {settings.app_name} on {settings.host}:{settings.port}")
-    logger.info(f"API Key: {settings.agent_api_key[:4]}****")
     uvicorn.run(
         "app.main:app",
         host=settings.host,
