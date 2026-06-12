@@ -27,6 +27,7 @@ from typing import Optional
 import redis as redis_lib
 
 from fastapi import FastAPI, HTTPException, Security, Depends, Request, Response
+from fastapi.responses import HTMLResponse
 from fastapi.security.api_key import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -220,11 +221,132 @@ def root():
         "environment": settings.environment,
         "description": "Legal compliance agent powered by Gemini via Vertex AI",
         "endpoints": {
+            "ui": "GET /ui (chat interface)",
             "ask": "POST /ask (requires X-API-Key)",
             "health": "GET /health",
             "ready": "GET /ready",
         },
     }
+
+
+@app.get("/ui", response_class=HTMLResponse, tags=["Info"], include_in_schema=False)
+def ui():
+    return HTMLResponse(content="""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Legal Compliance Agent</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, sans-serif; background: #0f172a; color: #e2e8f0; height: 100vh; display: flex; flex-direction: column; }
+  header { background: #1e293b; padding: 16px 24px; border-bottom: 1px solid #334155; display: flex; align-items: center; gap: 12px; }
+  header h1 { font-size: 1.1rem; font-weight: 600; }
+  header span { font-size: 0.75rem; background: #0ea5e9; color: #fff; padding: 2px 8px; border-radius: 9999px; }
+  .config { background: #1e293b; padding: 10px 24px; border-bottom: 1px solid #334155; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  .config label { font-size: 0.8rem; color: #94a3b8; }
+  .config input { background: #0f172a; border: 1px solid #334155; color: #e2e8f0; padding: 6px 10px; border-radius: 6px; font-size: 0.85rem; width: 260px; }
+  .config input:focus { outline: none; border-color: #0ea5e9; }
+  #chat { flex: 1; overflow-y: auto; padding: 20px 24px; display: flex; flex-direction: column; gap: 16px; }
+  .msg { max-width: 75%; display: flex; flex-direction: column; gap: 4px; }
+  .msg.user { align-self: flex-end; }
+  .msg.bot  { align-self: flex-start; }
+  .bubble { padding: 10px 14px; border-radius: 12px; font-size: 0.9rem; line-height: 1.6; white-space: pre-wrap; }
+  .user .bubble { background: #0ea5e9; color: #fff; border-bottom-right-radius: 2px; }
+  .bot  .bubble { background: #1e293b; border: 1px solid #334155; border-bottom-left-radius: 2px; }
+  .ts { font-size: 0.7rem; color: #475569; padding: 0 4px; }
+  .user .ts { text-align: right; }
+  .typing { display: none; align-self: flex-start; }
+  .typing .bubble { background: #1e293b; border: 1px solid #334155; color: #64748b; font-style: italic; }
+  footer { background: #1e293b; border-top: 1px solid #334155; padding: 14px 24px; display: flex; gap: 10px; }
+  footer textarea { flex: 1; background: #0f172a; border: 1px solid #334155; color: #e2e8f0; padding: 10px 14px; border-radius: 8px; font-size: 0.9rem; resize: none; height: 44px; font-family: inherit; }
+  footer textarea:focus { outline: none; border-color: #0ea5e9; }
+  footer button { background: #0ea5e9; color: #fff; border: none; padding: 0 20px; border-radius: 8px; font-size: 0.9rem; cursor: pointer; font-weight: 600; }
+  footer button:hover { background: #0284c7; }
+  footer button:disabled { background: #334155; cursor: not-allowed; }
+</style>
+</head>
+<body>
+<header>
+  <h1>⚖️ Legal Compliance Agent</h1>
+  <span>Gemini 2.5 Flash</span>
+</header>
+<div class="config">
+  <label>API Key:</label>
+  <input id="apiKey" type="password" placeholder="X-API-Key" />
+  <label>Session:</label>
+  <input id="sessionId" type="text" placeholder="session-id (leave blank = no history)" style="width:180px" />
+</div>
+<div id="chat">
+  <div class="msg bot">
+    <div class="bubble">Xin chào! Tôi là Legal Compliance Agent. Hỏi tôi về NDA, tax evasion, data privacy, SOX compliance, hoặc bất kỳ vấn đề pháp lý nào.</div>
+    <div class="ts">Legal Compliance Agent</div>
+  </div>
+</div>
+<div class="typing" id="typing">
+  <div class="bubble">Đang phân tích...</div>
+</div>
+<footer>
+  <textarea id="input" placeholder="Nhập câu hỏi pháp lý..." rows="1"></textarea>
+  <button id="sendBtn" onclick="send()">Gửi</button>
+</footer>
+<script>
+  const chat = document.getElementById('chat');
+  const typing = document.getElementById('typing');
+
+  function addMsg(role, text) {
+    const d = document.createElement('div');
+    d.className = 'msg ' + role;
+    const ts = new Date().toLocaleTimeString('vi-VN', {hour:'2-digit', minute:'2-digit'});
+    d.innerHTML = `<div class="bubble">${text.replace(/</g,'&lt;').replace(/\*\*(.*?)\*\*/g,'<strong>$1</strong>').replace(/\n/g,'<br>')}</div><div class="ts">${role === 'user' ? 'Bạn' : 'Agent'} · ${ts}</div>`;
+    chat.appendChild(d);
+    chat.scrollTop = chat.scrollHeight;
+  }
+
+  async function send() {
+    const input = document.getElementById('input');
+    const apiKey = document.getElementById('apiKey').value.trim();
+    const sessionId = document.getElementById('sessionId').value.trim();
+    const q = input.value.trim();
+    if (!q) return;
+    if (!apiKey) { alert('Nhập API Key trước!'); return; }
+
+    input.value = '';
+    document.getElementById('sendBtn').disabled = true;
+    addMsg('user', q);
+    chat.appendChild(typing);
+    typing.style.display = 'flex';
+    chat.scrollTop = chat.scrollHeight;
+
+    try {
+      const body = { question: q };
+      if (sessionId) body.session_id = sessionId;
+      const res = await fetch('/ask', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-API-Key': apiKey },
+        body: JSON.stringify(body)
+      });
+      const data = await res.json();
+      typing.style.display = 'none';
+      if (res.ok) {
+        addMsg('bot', data.answer);
+      } else {
+        addMsg('bot', '❌ ' + (data.detail || 'Lỗi không xác định'));
+      }
+    } catch(e) {
+      typing.style.display = 'none';
+      addMsg('bot', '❌ Network error: ' + e.message);
+    }
+    document.getElementById('sendBtn').disabled = false;
+    input.focus();
+  }
+
+  document.getElementById('input').addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+  });
+</script>
+</body>
+</html>""")
 
 
 @app.post("/ask", response_model=AskResponse, tags=["Agent"])
